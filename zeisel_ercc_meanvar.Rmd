@@ -1,0 +1,240 @@
+---
+title: "Sequence specific properties of ERCC spike-ins in UMI data"
+author: "Andrew McDavid"
+date: 31-01-2017
+output:
+  html_document:
+    code_folding: hide
+    toc: yes
+    toc_float: yes
+  html_notebook: default
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache=TRUE, autodep=TRUE, message=FALSE, warning=FALSE)
+library(data.table)
+library(ggplot2)
+library(Biostrings)
+library(stringr)
+#install_github('amcdavid/Zeisel2015Data')
+library(MAST)
+library(mgcv)
+library(DT)
+library(MASS)
+library(broom)
+library(dplyr)
+library(dtplyr)
+
+```
+Data currently is just tables provided by Zeisel et al, with some attempt to clean up covariates.
+
+# Todo:
+1.  How does GC content, etc, affect biological vs technical variance estimates?
+2.  Why are we under-dispersed?
+
+```{r}
+data(data, package='Zeisel2015Data')
+zeisel = FromMatrix(data$expr, data$cdat, data$fdat)
+zeiself = zeisel[freq(zeisel)>.1]
+#expressed endogenous genes
+zeiself = zeiself[!mcols(zeiself)$primerid %like% 'ERCC-',]
+rm(data)
+blah = gc()
+```
+Load the data, which are log2+1 transformed UMIs, as well as gene and cell covariates.
+
+
+```{r erccRegressions, dev='png', fig.width=7, fig.height=5}
+erccz = zeisel[mcols(zeisel)$primerid %like% 'ERCC']
+erccdt = as(erccz, 'data.table')
+# "CDR" of the ERCC
+erccdt[,cdr_ercc_exclude := cdr_ercc - 1*(value>0)] #exclude current probe
+erccdt[, primerid:=factor(primerid)]
+erccdt[, wellKey:=factor(wellKey)]
+erccdt[, pgex_batch:=factor(pgex_batch)]
+```
+Get the ercc data and calculate some features on it.
+
+```{r, results='asis'}
+datatable(head(erccdt))
+```
+Using the manufacturers' values for the relative concentrations of the
+spike-in mix, and sequences I pre-calculated some of the features
+including **attomoles_per_ul** (concentration), **AfreqCenter**,
+proportion of adenosine content, minus .25, (etc), the length of the transcript `transcript_len_bp`.  These features were calculated in the data package, see the source under https://github.com/amcdavid/Zeisel2015Data/blob/master/data-raw/datasets.R for details.
+
+The Zeisel data also provided information on the mRNA molecules (total UMIs) `mRNA.molecules`, the size of the cell `pgex_cell_size_um`.
+I inferred a batch ID from the fluidigm run ID `pgex_batch` and calculated the CDR of the exogenous ERCC `cdr_ercc` and CDR of endogenous transcript `cdr_endo`.
+
+
+# Fit some simple models to ERCC-concentration
+The spike-ins might help answer three questions:
+
+1.   What is the distribution of UMIs as a function of the concentration of mRNA in the lysate?  Since we'll be using a linear model, this question is really about the goodness of fit under different linear models.  **Q: How to compare zero-inflated vs regular models graphically?**  Will the AIC/BIC serve for formal comparison?  Dominating measure differs between count and approximate Gaussian models.
+2.   How do sequence-specific features affect this relationship?
+3.   How do cellular features affect it?
+4.   How do sequence-specific and cell-specific factors affect the transcript deviance estimates (used for determining "biological" vs "technical" variant genes.
+
+Let's investigate with some GLMs, first.  We are fitting models of the form
+$$
+E(Y) = \beta \text{ Conc. ERCC}
+$$
+```{r}
+# Only using the concentration, log-log
+unlog = function(x) round(2^x - 1)
+
+lineareffect = lm(unlog(value) ~ attomoles_per_ul, data=erccdt)
+loglog = lm(value ~ log2(attomoles_per_ul+1), data=erccdt)
+qp_log = glm(unlog(value) ~ attomoles_per_ul, data=erccdt, family='quasipoisson')
+qp = glm(unlog(value) ~ attomoles_per_ul, data=erccdt, family=quasipoisson(link='identity'), mustart=predict(qp_log, response='response'))
+nb = glm.nb(unlog(value) ~ attomoles_per_ul, data=erccdt, link='identity', mustart=predict(qp_log, response='response'))
+
+model_summary = function(fit){
+    t_fit = augment(fit, type.residuals='pearson', type.predict='response')
+    pid = erccdt$primerid
+    t_fit = t_fit %>% mutate(pearson.resid = resid(fit, type='pearson'), primerid = pid)
+    cl = match.call()
+    t_fit  = t_fit %>% mutate(f_group = cut(log(.fitted), 10), nonzero=t_fit[,1]>0) %>% group_by(f_group) %>% mutate(f_group_mean = mean(.fitted), mean_resid=mean(pearson.resid))
+    ## Incorrect dispatch on `bam` objects
+    if('gam' %in% class(fit)){
+            g_fit = broom:::glance_mcgv(fit)
+            g_fit$r.squared = summary(fit)$r.sq
+        } else{
+            g_fit = glance(fit)
+        }
+    
+    if(is.null(g_fit$r.squared)) g_fit$r.squared = 1-g_fit$deviance/g_fit$null.deviance
+    resid_plot = ggplot(t_fit, aes(y=pearson.resid)) + sprintf('Model=%s, R2 = %1.3f, AIC = %e', deparse(cl[[2]]), g_fit$r.squared, g_fit$AIC) %>% ggtitle() + xlab("Fitted values (binned)")
+    print(resid_plot +aes(x=f_group)+ geom_boxplot(varwidth=TRUE))
+    primer_resid = t_fit %>% group_by(primerid) %>% summarise(q25 = quantile(pearson.resid, .25), q75=quantile(pearson.resid, .75)) %>% mutate(primerid = forcats::fct_reorder(primerid, q25))
+    print(ggplot(primer_resid, aes(x=primerid, ymin=q25, ymax=q75)) + geom_linerange() + ylab('IQR(Pearson Residuals)') +coord_flip())
+    invisible(list(t_fit, primer_resid))
+}
+
+model_summary(lineareffect)
+model_summary(loglog)
+model_summary(qp)
+model_summary(nb)
+
+```
+
+In concentration-only model, the linear model:
+
+1.  Fits poorly (lowest R^2)
+2.  The log-log model fits better
+3.  But a negative binomial fits well, too, but you gotta use the identity link function. (Which makes it awkward to get the correct starting values).
+4. If you use the wrong model, you get a horrible looking residual-dispersion dependence on ERCC concentration.
+
+
+# Now for some GAMs
+```{r}
+# Giant GAM, use 'cr' basis for sake of speed
+
+theta=c(nb$theta/3, nb$theta*3)
+linkv = 'log' #could also try sqrt, hard to diagnose which to use
+link = log
+estimate_theta = gam(unlog(value) ~ s(link(attomoles_per_ul), bs='cr', k=13) + s(primerid, bs='re'), data=erccdt, family=negbin(link=linkv, theta=theta), mustart=predict(nb, type='response'), optimizer='perf', scale=-1)
+
+
+```
+With the GAMs, we don't need to the link function in order to model the linear-ish relationship between `attomoles_per_ul` and the values, since the splines can handle whatever functional form is present.  Instead, the link function controls the additivity.  Identity=additive effects, log=multiplicative, sqrt = power.
+
+```{r}
+gam_gc2 = gam(update(estimate_theta$formula, .~. + s(I(GfreqCenter+CfreqCenter), bs='cr', k=12) + s(AfreqCenter, bs='cr', k=12) + s(transcript_len_bp, bs='cr', k=12)), 
+              data=erccdt, optimizer='perf', scale=1.6,
+              family=negbin(link=linkv, theta=estimate_theta$family$Theta),
+              mustart=predict(estimate_theta, type='response'))
+
+pearson_scale = function(fit)  sum(resid(fit, type='pearson')^2)/fit$df.residual
+
+plot(gam_gc2, scheme=1, scale=0)
+
+```
+
+`I(GfreqCenter+CfreqCenter)` is the GC-frequency minus .5.
+
+
+```{r}
+pearson_scale(gam_gc2)
+```
+We can't easily estimate the negative binomial dispersion, but we
+check that the Pearson scale estimate is close to unity.
+
+
+```{r}
+ms = model_summary(gam_gc2)
+```
+
+Now we add GC content, A content, length of the ERCC in base pairs and a random effect.
+There is little evidence of a mean relationship between these
+
+
+```
+
+```{r plot_primer_feats}
+primer_disp = ms[[2]] %>% left_join(as.data.frame(rowData(erccz)))
+disp_plot = ggplot(primer_disp, aes(x=CfreqCenter + GfreqCenter, ymin=q25, ymax=q75))+geom_linerange() + ylab('IQR(Pearson Residuals)') + ggtitle("Dispersion vs ERCC features") + geom_point(aes(y=q75-q25, color='range')) + geom_smooth(aes(y=q75-q25, color='range'))
+disp_plot
+```
+
+Let's look at some other ways to correlated the model dispersion to ERCC features.  Here's the GC frequency.
+
+```{r conc_dispersion_plot}
+disp_plot + aes(jitter(attomoles_per_ul, amount=min(attomoles_per_ul)*2)) + scale_x_log10()
+disp_plot +  aes(x=rank(attomoles_per_ul, ties='random'))
+```
+
+Concentration
+
+```{r}
+disp_plot +                   aes(x=rank(transcript_len_bp, ties='random'))
+```
+
+Length
+
+Finally we add a random effect for the ERCC-id.  This smooths the length and GC relationships.
+
+In conclusion, the linear model fits a negative binomial pretty well. There is evidence of GC and length bias, but the ERCC-specific random effect is much more substantial and distinctly non-normal looking.
+
+Theta is around 5 so the model between a geometric and a  Poisson,  $\sigma^2 \approx \mu +\mu^2/5$.
+
+## Cellular level covariates
+What we really care about is the relationship between the ERCC and endogenous transcript.  A first step in modelling this is to examine the relationship between cell-level covariates and counts.
+
+
+```{r}
+# + s(transcript_len_bp, bs='cr') + s(log2(mRNA.molecules), bs='cr') + s(cdr_ercc_exclude,bs='cr') + s(primerid, bs='re') +  s(pgex_batch, bs='re')
+#  + s(pgex_cell_size_um, bs='cr') + s(mRNA.molecules, bs='cr')
+gam_cell = bam(unlog(value)~ s(log(attomoles_per_ul), bs='cr') + s(I(GfreqCenter + CfreqCenter)) + AfreqCenter + I(transcript_len_bp/1000) + s(primerid, bs='re')  +poly(cdr_ercc_exclude,2) + poly(cdr_endo,2), data=erccdt, family=negbin(link='log', theta=estimate_theta$family$Theta*2.5), discrete=TRUE)
+
+summary(gam_cell)
+pearson_scale(gam_cell)
+
+plot(gam_cell, scale=0, scheme=1)
+```
+
+Add cellular effects--the model hates anything except a log link, which has a dramatic impact on the significance of the CG estimates, for example...
+
+```{r}
+gam_cell2 = update(gam_cell, . ~ s(log(attomoles_per_ul)) + s(pgex_batch, bs='re') + s(primerid, bs='re') + cdr_endo +I(transcript_len_bp/1000)+ s(cdr_ercc_exclude, bs='cr') + s(I(CfreqCenter + GfreqCenter), bs='cr'), family = negbin(theta = estimate_theta$family$Theta*2.5, link='log'))
+plot(gam_cell2, scale=0, scheme=1)
+pearson_scale(gam_cell2)
+
+ms = model_summary(gam_cell2)
+<<plot_primer_feats>>
+<<conc_dispersion_plot>>
+```
+
+## Direct modeling of the variance function
+
+And actually, we can directly model the variance function with GAMs
+(at least in a two-step procedure).  We just model the log-squared pearson
+residuals as a additive, smooth function of covariates (corresponding
+to a log-normal model).
+```{r}
+erccdt[,resid:=resid(gam_cell2, type='pearson')]
+gam_var = update(gam_cell2, log(resid^2) ~ . - cdr_endo - I(transcript_len_bp/1000) + s(transcript_len_bp, bs='cr') + s(cdr_endo, bs='cr'), family=gaussian())
+
+hist(erccdt[,resid])
+plot(gam_var, scale=0, scheme=1)
+
+```
