@@ -1,0 +1,304 @@
+---
+title: 'Exploring relationship between HVGs and GC content in Zeisel mouse cortex'
+author: "Stephanie Hicks"
+date: "`r Sys.Date()`"
+output: 
+    html_document:
+        toc: true
+        toc_float: true
+        highlight: tango
+        number_sections: true
+        code_folding: hide
+---
+
+```{r load-libararies, message=FALSE, warning=FALSE}
+library(scater)
+library(scran)
+library(data.table)
+library(cowplot)
+
+baseDir <- "/net/irizarryfs01/srv/export/irizarryfs01_backed_up/share_root/shicks/papers/zeisel"
+
+```
+
+# Load the Zeisel et al mouse cortex data
+
+The mouse cortex data from [Zeisel et al, 2015](http://science.sciencemag.org/content/347/6226/1138)
+have been made available as UMI (unique molecular identifier) counts at the 
+[Linnarsson Lab website](http://linnarssonlab.org/blobs/cortex/).
+
+Here we download the data, create an `SCESet` object. 
+Data uses UMIs, so we use counts per million (CPM) in `exprs` slot as transcript length is irrelevant. 
+
+### Create `SCESet` object
+
+
+```{r load-data, cache=FALSE}
+# First load the data for metadata for mRNA genes:
+mrna_meta <- fread("https://storage.googleapis.com/linnarsson-lab-www-blobs/blobs/cortex/expression_mRNA_17-Aug-2014.txt",
+              nrows = 10, header = FALSE)
+mrna_meta <- as.data.frame(t(mrna_meta), stringsAsFactors = FALSE)
+colnames(mrna_meta) <- mrna_meta[2,]
+mrna_meta <- mrna_meta[-c(1,2),]
+rownames(mrna_meta) <- mrna_meta$cell_id
+
+# Now load the count data for the mRNA genes:
+mrna <- fread("https://storage.googleapis.com/linnarsson-lab-www-blobs/blobs/cortex/expression_mRNA_17-Aug-2014.txt",
+              skip = 10)
+mrna <- as.data.frame(mrna)
+rownames(mrna) <- mrna$V1
+mrna_gene_cluster <- mrna$V2
+mrna <- mrna[, -c(1,2)]
+colnames(mrna) <- mrna_meta$cell_id
+
+# Next load the metadata for mitochondrial genes:
+mtgenes_meta <- fread("https://storage.googleapis.com/linnarsson-lab-www-blobs/blobs/cortex/expression_mito_17-Aug-2014.txt",
+                      nrows = 10, header = FALSE)
+mtgenes_meta <- as.data.frame(t(mtgenes_meta), stringsAsFactors = FALSE)
+colnames(mtgenes_meta) <- mtgenes_meta[2,]
+mtgenes_meta <- mtgenes_meta[-c(1,2),]
+rownames(mtgenes_meta) <- mtgenes_meta$cell_id
+
+# Followed by the count data for mitochondrial genes:
+mtgenes <- fread("https://storage.googleapis.com/linnarsson-lab-www-blobs/blobs/cortex/expression_mito_17-Aug-2014.txt",
+                 skip = 10)
+mtgenes <- as.data.frame(mtgenes)
+rownames(mtgenes) <- mtgenes$V1
+mtgenes <- mtgenes[, -c(1,2)]
+colnames(mtgenes) <- mtgenes_meta$cell_id
+
+# Finally load the metadata for ERCC spike-ins:
+ercc_meta <- fread("https://storage.googleapis.com/linnarsson-lab-www-blobs/blobs/cortex/expression_spikes_17-Aug-2014.txt",
+                   nrows = 10, header = FALSE)
+ercc_meta <- as.data.frame(t(ercc_meta), stringsAsFactors = FALSE)
+colnames(ercc_meta) <- ercc_meta[2,]
+ercc_meta <- ercc_meta[-c(1,2),]
+rownames(ercc_meta) <- ercc_meta$cell_id
+
+# and then the count data for the ERCC spike-ins:
+ercc <- fread("https://storage.googleapis.com/linnarsson-lab-www-blobs/blobs/cortex/expression_spikes_17-Aug-2014.txt",
+                   skip = 10)
+ercc <- as.data.frame(ercc)
+rownames(ercc) <- ercc$V1
+ercc <- ercc[, -c(1,2)]
+colnames(ercc) <- ercc_meta$cell_id
+```
+
+Now, after checking that the cell IDs match up in the different data frames we 
+have loaded, combine data and form into an SCESet object:
+
+```{r check-ids, results='hide'}
+identical(mtgenes_meta[rownames(mrna_meta),], mrna_meta)
+identical(ercc_meta[rownames(mrna_meta),], mrna_meta)
+## cell metadata matches as long as cells are matched
+mtgenes <- mtgenes[, rownames(mrna_meta)]
+identical(colnames(mtgenes), colnames(mrna))
+ercc <- ercc[, rownames(mrna_meta)]
+identical(colnames(ercc), colnames(mrna))
+```
+
+```{r make-sceset}
+## combine expression values
+counts <- rbind(mrna, mtgenes, ercc)
+dim(counts)
+pd <- new("AnnotatedDataFrame", mrna_meta)
+fd <- data.frame(gene_cluster = c(mrna_gene_cluster, 
+                                rep(NA, (nrow(ercc) + nrow(mtgenes)))))
+rownames(fd) <- rownames(counts)
+fd <- new("AnnotatedDataFrame", fd)
+sce_zeisel_raw <- newSCESet(countData = counts, phenoData = pd, featureData = fd)
+sce_zeisel_raw
+```
+
+### Calculate QC metrics
+Define "feature controls" with ERCC spike-ins and mitochondrial genes. 
+Calculate QC metrics.
+
+```{r}
+ercc_genes <- grep("ERCC", featureNames(sce_zeisel_raw))
+mt_genes <- grep("mt-", featureNames(sce_zeisel_raw))
+
+nrows <- c(nrow(sce_zeisel_raw) - length(mt_genes) - length(ercc_genes), length(mt_genes), length(ercc_genes))
+is.ercc <- rep(c(FALSE, FALSE, TRUE), nrows)
+is.mito <- rep(c(FALSE, TRUE, FALSE), nrows)
+
+sce_zeisel_raw <- calculateQCMetrics(sce_zeisel_raw, 
+                          feature_controls=list(ERCC = ercc_genes, mt = mt_genes))
+setSpike(sce_zeisel_raw) <- "ERCC" # specifies which feature control sets in SCESet are spike-ins
+summary(isSpike(sce_zeisel_raw))
+```
+
+Sum "Level 1" classifications. 
+```{r, echo=TRUE, eval=TRUE}
+# Min level 1 classification includes only 98 cells. 
+table(sce_zeisel_raw$level1class) 
+```
+
+
+### Filter cells and genes
+
+Filter genes. Use `calcIsExprs()` and `is_exprs()` to require a gene to have 
+at least one count in at least 98 cells (smallest group of cells in Zeisel et al.). 
+Rationale: Want to keep genes expressed in just one group of cells, but not with  
+sparse expression overall. 
+
+```{r}
+is_exprs(sce_zeisel_raw) <- calcIsExprs(sce_zeisel_raw, lowerDetectionLimit = 0,
+    exprs_values = "counts")           # expressed is defined non-zero in counts 
+keep_gene <- rowSums(is_exprs(sce_zeisel_raw)) >= 98
+fData(sce_zeisel_raw)$use <- keep_gene # use these genes in normalization and downstream analyses
+```
+
+
+Filter low-quality cells 
+```{r}
+libsize.drop <- isOutlier(sce_zeisel_raw$total_counts, nmads=3, type="lower", log=TRUE) # number molecules counted
+feature.drop <- isOutlier(sce_zeisel_raw$total_features, nmads=3, type="lower", log=TRUE)  # number of features
+mito.drop <- isOutlier(sce_zeisel_raw$pct_counts_feature_controls_mt, nmads=3, type="higher") # remove cells with high % mt 
+spike.drop <- isOutlier(sce_zeisel_raw$pct_counts_feature_controls_ERCC, nmads=3, type="higher") # remove cells with high % ercc
+
+sce_zeisel_raw$use <- !(libsize.drop | feature.drop | spike.drop | mito.drop)
+```
+
+Summary of filtering process 
+```{r} 
+data.frame(ByLibSize=sum(libsize.drop), ByFeature=sum(feature.drop),
+    ByMito=sum(mito.drop), BySpike=sum(spike.drop), Remaining=sum(sce_zeisel_raw$use))
+```
+
+
+
+# Normalization
+
+From (https://f1000research.com/articles/5-2122/v2): "Some datasets also contain strong heterogeneity in mitochondrial RNA content, possibly due to differences in mitochondrial copy number or activity between cell types. This heterogeneity will cause mitochondrial genes to dominate the top set of results, e.g., for identification of correlated HVGs. However, these genes are largely uninteresting given that most studies focus on nuclear regulation. As such, we filter them out prior to further analysis. Other candidates for removal include pseudogenes or ribosome-associated genes, which might not be relevant for characterising cell types but can still interfere with the interpretation of the results."
+
+So we filter out the mt genes before normalization and identifying HVGs. 
+
+```{r sizefactor-normalisation, echo=TRUE, eval=TRUE, message=FALSE, warning=FALSE}
+## subset to form a QC'd version of the data
+
+head(fData(sce_zeisel_raw))
+sce_zeisel_qc <- sce_zeisel_raw[(fData(sce_zeisel_raw)$use | fData(sce_zeisel_raw)$is_feature_spike), 
+                                sce_zeisel_raw$use] 
+endog_genes <- !fData(sce_zeisel_qc)$is_feature_spike
+
+## size factor normalisation with scran 
+qclust <- quickCluster(sce_zeisel_qc)
+sce_zeisel_qc <- computeSumFactors(sce_zeisel_qc, clusters = qclust)
+summary(sce_zeisel_qc$size_factor)
+
+# wider scatter plot than just along the line; reflects DE between cell types in Zeisel data
+plot(sizeFactors(sce_zeisel_qc), sce_zeisel_qc$total_counts/1e3, log="xy",
+    ylab="Library size (thousands)", xlab="Size factor")
+
+# compute scaling factors (total counts of ERCC spikes) separately for ERCC spikes
+sce_zeisel_qc <- computeSpikeFactors(sce_zeisel_qc, type="ERCC", general.use=FALSE)
+
+# normalize data
+sce_zeisel_qc <- normalize(sce_zeisel_qc)
+
+```
+
+
+
+# identify highly variable genes
+
+```{r}
+var.fit <- trendVar(sce_zeisel_qc, use.spikes=TRUE) # must use use.spikes=TRUE (default) bc use.spikes=FALSE assumes no DE across cells; this not the case with Zeisel data
+decomp <- decomposeVar(sce_zeisel_qc, var.fit)
+decomp$SYMBOL <- rownames(decomp)
+top.hvgs <- order(decomp$bio, decreasing=TRUE)
+head(decomp[top.hvgs,], 10)
+
+# we see the variance of ERCC spike-ins are much smaller than the var of endog genes
+# this reflects the heterogeneity in gene expression across cells of different types.
+# Also means we cannot fit a trend to the endog var only (i.e. cannot use.spikes=FALSE) in trendVar)
+pdf(file.path(baseDir, "figs/MeanVar_relationship.pdf"), width = 6, height = 6)
+par(mfrow=c(1,1))
+plot(decomp$mean, decomp$total, xlab="Mean log-expression", ylab="Variance")
+points(decomp[top.hvgs[1:1000],]$mean, decomp[top.hvgs[1:1000],]$total, col = "green")
+points(var.fit$mean, var.fit$var, col="red", pch=16)
+o <- order(decomp$mean)
+lines(decomp$mean[o], decomp$tech[o], col="red", lwd=2)
+dev.off()
+```
+
+
+Calculate gc content for every gene in mouse genome 
+```{r}
+library(BSgenome.Mmusculus.UCSC.mm10) # load BSgenome package for mouse 
+genome <- BSgenome.Mmusculus.UCSC.mm10
+library(TxDb.Mmusculus.UCSC.mm10.ensGene) # load TxDb object for mouse using ensembl genes 
+txdb <- TxDb.Mmusculus.UCSC.mm10.ensGene
+
+# extract DNA string for only exons in each mouse gene
+gene_seqs1 <- extractTranscriptSeqs(genome, exonsBy(txdb, by = "gene"))
+
+# function to calculate gc content 
+gcContent <- function(x){
+  alf <- alphabetFrequency(x, as.prob=TRUE)
+  sum(alf[c("G", "C")]) 
+}
+
+# calculate gc content for every transcript in mouse genome
+genedbNames <- names(gene_seqs1)
+gcVals <- numeric(length(genedbNames))             # pre-allocate...
+minLen <- pmin(width(gene_seqs1), 300)
+Sys.time()
+for (ind in seq_along(genedbNames)) { 
+  gcVals[ind] <- gcContent(subseq(gene_seqs1[[ind]]))
+}
+Sys.time()
+
+dat <- data.frame(ENSEMBL = genedbNames, "gc" = gcVals)
+head(dat)
+```
+
+Convert from gene symbol to ENSEMBL name
+
+```{r}
+library(org.Mm.eg.db)
+anno <- select(org.Mm.eg.db, keys=rownames(decomp), keytype="SYMBOL", column="ENSEMBL") 
+anno$ENSEMBL[grep("ERCC", anno$SYMBOL)] <- anno$SYMBOL[grep("ERCC", anno$SYMBOL)]
+
+dat.joined <- left_join(anno, dat,  by = "ENSEMBL")
+
+# add gc content of ERCC spike-ins
+data <- read.table("http://tools.thermofisher.com/downloads/ERCC_Controls_Annotation.txt", header=TRUE, stringsAsFactors=FALSE)
+gcValsERCC <- numeric(length(data$ERCC_ID))             # pre-allocate...
+for (ind in seq_along(data$ERCC_ID)) { 
+  gcValsERCC[ind] <- gcContent(subseq(DNAString(data$Sequence[ind])))
+}
+
+dat.joined[dat.joined$SYMBOL %in% data$ERCC_ID , ]$gc <- 
+  gcValsERCC[match(dat.joined$SYMBOL[grep("ERCC", dat.joined$SYMBOL)], data$ERCC_ID)]
+
+
+
+
+x <- left_join(decomp, dat.joined, by = "SYMBOL")
+x_ercc <- x[grep("ERCC", x$SYMBOL), ]
+x <- na.omit(x)
+
+
+pdf(file.path(baseDir, "figs/VarandGCcontent_relationship.pdf"), width = 12, height = 5)
+par(mfrow=c(1,3))
+plot(x$gc,x$total, ylim = c(0, 1), xlab = "GC content", ylab = "total variance")
+fit.lo <- loess(x$total ~ x$gc)
+points(x$gc, predict(fit.lo), col = 2) 
+points(x_ercc$gc, x_ercc$total, col = 6, pch = 16)
+
+plot(x$gc,x$tech, xlab = "GC content", ylab = "technical variance")
+fit.lo <- loess(x$tech ~ x$gc)
+points(x$gc, predict(fit.lo), col = 2)
+points(x_ercc$gc, x_ercc$tech, col = 6, pch = 16)
+
+plot(x$gc,x$bio, ylim = c(-.1, 1), xlab = "GC content", ylab = "biologial variance")
+fit.lo <- loess(x$bio ~ x$gc)
+points(x$gc, predict(fit.lo), col = 2)
+points(x_ercc$gc, x_ercc$bio, col = 6, pch = 16)
+dev.off()
+
+```
+
+
