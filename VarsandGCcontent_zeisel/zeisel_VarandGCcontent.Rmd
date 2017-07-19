@@ -14,11 +14,12 @@ output:
 ```{r load-libararies, message=FALSE, warning=FALSE}
 library(scater)
 library(scran)
-library(data.table)
 library(cowplot)
+library(dplyr)
+library(gplots)
+library(RColorBrewer)
 
-baseDir <- "/net/irizarryfs01/srv/export/irizarryfs01_backed_up/share_root/shicks/papers/zeisel"
-
+baseDir <- "/net/irizarryfs01/srv/export/irizarryfs01_backed_up/share_root/shicks/projects/exploreHVGandGCbias"
 ```
 
 # Load the Zeisel et al mouse cortex data
@@ -27,8 +28,8 @@ The mouse cortex data from [Zeisel et al, 2015](http://science.sciencemag.org/co
 have been made available as UMI (unique molecular identifier) counts at the 
 [Linnarsson Lab website](http://linnarssonlab.org/blobs/cortex/).
 
-Here we download the data, create an `SCESet` object. 
-Data uses UMIs, so we use counts per million (CPM) in `exprs` slot as transcript length is irrelevant. 
+Here we download the data, create an `SCESet` object. Uses UMIs, 
+so we use counts per million (CPM) in `exprs` slot as transcript length is irrelevant. 
 
 ### Create `SCESet` object
 
@@ -213,7 +214,7 @@ head(decomp[top.hvgs,], 10)
 # we see the variance of ERCC spike-ins are much smaller than the var of endog genes
 # this reflects the heterogeneity in gene expression across cells of different types.
 # Also means we cannot fit a trend to the endog var only (i.e. cannot use.spikes=FALSE) in trendVar)
-pdf(file.path(baseDir, "figs/MeanVar_relationship.pdf"), width = 6, height = 6)
+pdf(file.path(baseDir, "figs/MeanVar_relationship_Zeisel.pdf"), width = 6, height = 6)
 par(mfrow=c(1,1))
 plot(decomp$mean, decomp$total, xlab="Mean log-expression", ylab="Variance")
 points(decomp[top.hvgs[1:1000],]$mean, decomp[top.hvgs[1:1000],]$total, col = "green")
@@ -281,7 +282,7 @@ x_ercc <- x[grep("ERCC", x$SYMBOL), ]
 x <- na.omit(x)
 
 
-pdf(file.path(baseDir, "figs/VarandGCcontent_relationship.pdf"), width = 12, height = 5)
+pdf(file.path(baseDir, "figs/VarandGCcontent_relationship_Zeisel.pdf"), width = 12, height = 5)
 par(mfrow=c(1,3))
 plot(x$gc,x$total, ylim = c(0, 1), xlab = "GC content", ylab = "total variance")
 fit.lo <- loess(x$total ~ x$gc)
@@ -298,6 +299,87 @@ fit.lo <- loess(x$bio ~ x$gc)
 points(x$gc, predict(fit.lo), col = 2)
 points(x_ercc$gc, x_ercc$bio, col = 6, pch = 16)
 dev.off()
+
+```
+
+```{r}
+pdf(file.path(baseDir, "figs/VarandGCcontent_relationship_correct_Zeisel.pdf"), width = 8, height = 5)
+par(mfrow=c(1,2))
+plot(x$gc,x$bio, xlab = "GC content", ylab = "biologial variance", ylim = c(-.1, 1))
+fit.lo.gc <- loess(x$bio ~ x$gc)
+points(x$gc, predict(fit.lo), col = 2)
+points(x_ercc$gc, x_ercc$bio, col = 6, pch = 16)
+
+x$bio_new <- x$bio - predict(fit.lo.gc)
+
+plot(x$gc, x$bio_new, ylim=c(-0.4, 1))
+fit.lo.new <- loess( x$bio_new ~ x$gc)
+points(x$gc, predict(fit.lo.new), col = 2) 
+dev.off()
+
+
+
+
+x$bio_order <- seq(1:nrow(x))
+x$bio_new_order <- seq(1:nrow(x))
+
+x[order(x$bio, decreasing = TRUE),]$bio_order <- seq(1:nrow(x))
+x[order(x$bio_new, decreasing = TRUE),]$bio_new_order <- seq(1:nrow(x))
+
+plot(x$bio_order, x$bio_new_order)
+abline(0,1, col =2)
+plot(x$bio_order, x$bio_new_order, xlim =c(1, 1000), ylim = c(0, 1000))
+abline(0, 1, col =2)
+
+x.bio <- x[order(x$bio, decreasing = TRUE),]
+x.bio_new <- x[order(x$bio_new, decreasing = TRUE),]
+
+
+library(ggplot2)
+x %>% ggplot(aes(x=bio_order, y=bio_new_order, col = gc)) + geom_point()
+x.bio_new[1:100,] %>% ggplot(aes(x=bio_order, y=bio_new_order, col = log(bio_new+.5))) + geom_point()
+
+
+head(x.bio, 10)
+head(x.bio_new, 10)
+
+dim(x.bio[which(x.bio$FDR <= 0.05 & x.bio$bio >= 1),])
+dim(x.bio_new[which(x.bio_new$FDR <= 0.05 & x.bio_new$bio_new >= 1),])
+
+g1 <- x.bio[which(x.bio$FDR <= 0.05 & x.bio$bio >= 1),]$SYMBOL
+g2 <- x.bio_new[which(x.bio_new$FDR <= 0.05 & x.bio_new$bio_new >= 1),]$SYMBOL
+
+
+setdiff(g1, g2)
+
+colors <- colorRampPalette(rev(brewer.pal(9, "PuOr")))(
+  length(levels(as.factor(pData(sce_zeisel_qc)$level1class))))
+sidecols <- colors[ as.factor(pData(sce_zeisel_qc)$level1class) ]
+
+
+pdf(file.path(baseDir, "figs/heatmap_Zeisel_celltype_g1.pdf"), width = 12, height = 5)
+norm.exprs <- exprs(sce_zeisel_qc)[rownames(exprs(sce_zeisel_qc)) %in% g1, ] 
+heat.vals <- norm.exprs - rowMeans(norm.exprs)
+heatmap.2(heat.vals, col=bluered, symbreak=TRUE, 
+          trace='none', cexRow=0.6, ColSideColors=sidecols)
+dev.off()
+
+pdf(file.path(baseDir, "figs/heatmap_Zeisel_celltype_g2.pdf"), width = 12, height = 5)
+norm.exprs <- exprs(sce_zeisel_qc)[rownames(exprs(sce_zeisel_qc)) %in% g2, ] 
+heat.vals <- norm.exprs - rowMeans(norm.exprs)
+heatmap.2(heat.vals, col=bluered, symbreak=TRUE, 
+          trace='none', cexRow=0.6, ColSideColors=sidecols)
+dev.off()
+
+
+pdf(file.path(baseDir, "figs/heatmap_Zeisel_celltype_setdiff.pdf"), width = 12, height = 5)
+norm.exprs <- exprs(sce_zeisel_qc)[rownames(exprs(sce_zeisel_qc)) %in% setdiff(g1, g2), ] 
+heat.vals <- norm.exprs - rowMeans(norm.exprs)
+heatmap.2(heat.vals, col=bluered, symbreak=TRUE, 
+          trace='none', cexRow=0.6, ColSideColors=sidecols)
+dev.off()
+
+
 
 ```
 
