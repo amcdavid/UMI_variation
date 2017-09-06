@@ -1,0 +1,171 @@
+---
+title: 'Exploring relationship between HVGs and GC content in Jaitin et al. 2014 data'
+author: "Stephanie Hicks"
+date: "`r Sys.Date()`"
+output: 
+    html_document:
+        toc: true
+        toc_float: true
+        highlight: tango
+        number_sections: true
+        code_folding: hide
+---
+
+```{r load-libararies, message=FALSE, warning=FALSE}
+library(readr)
+library(scater)
+library(scran)
+
+baseDir <- "/net/irizarryfs01/srv/export/irizarryfs01_backed_up/share_root/shicks/projects/exploreHVGandGCbias"
+```
+
+# Load the Marinov et al. (2014) data 
+
+Contains the following data: 
+* 15 scRNA-seq libraries from GM12878 cell line
+* two pairs of 10-cell pool/split experiments
+* replicates of pools of multiple cells (10, 30 and 100 cells)
+* 100-pg and 10-ng samples of bulk RNA (corresponding to 10 and 1000 cells, approximately)
+
+Loads a `SingleCellExperiment`
+
+```{r}
+# library(devtools)
+# install_github("stephaniehicks/scRNASeqHumanMarinovSplitPool")
+library(scRNASeqHumanMarinovSplitPool)
+data(sce_marinov) # loads sce
+
+rownames(sce) <- rowData(sce)$gene_id
+pd <- colData(sce) 
+pd$sample_type <- ifelse(grepl("pool_split_", pd$title), "pool_split_A", 
+       ifelse(grepl("pool_split", pd$title) & !grepl("pool_split_", pd$title), "pool_split_B",
+              "C"))
+pd$sample_type[1] <- "100cells_A"
+pd$sample_type[2] <- "100cells_B"
+pd$sample_type[3] <- "30cells_A"
+pd$sample_type[4] <- "30cells_B"
+pd$sample_type[5] <- "10cells_A"
+pd$sample_type[6] <- "10cells_B"
+
+pd$sample_type[23] <- "10ng_A" # bulk RNA-Seq
+pd$sample_type[24] <- "10ng_B" # bulk RNA-Seq
+pd$sample_type[25] <- "100pg_A" # bulk RNA-Seq
+pd$sample_type[26] <- "100pg_B" # bulk RNA-Seq
+
+pd$sample_type[39] <- "10cells" 
+pd$sample_type[40] <- "11cells" 
+pd$sample_type[41] <- "100cells" 
+pd$sample_type[42] <- "100cells"
+
+pd$sample_type[c(7:22, 27:38)] <- "scRNA-seq"
+```
+
+
+# QC/Normalization
+
+- Want to keep all pool/split libraries (10 cells, x2 biological replicates). 
+- Normalization is already applied (FPKM from Cufflinks)
+- No ERCC or mito genes found. Tried to search using `grep`
+
+
+```{r}
+sce.sub <- sce[, pd$sample_type == "pool_split_A"]
+# sce.sub <- sce[, pd$sample_type == "pool_split_B"]
+# sce.sub <- sce[, pd$sample_type == "scRNA-seq"]
+# sce.sub <- sce[, pd$sample_type %in% c("pool_split_A", "pool_split_B")]
+```
+
+
+# identify highly variable genes
+
+```{r}
+library(stringr)
+
+dat <- log2(assay(sce.sub) + 1)
+var.fit <- trendVar(dat) 
+decomp <- decomposeVar(dat, var.fit)
+rownames(decomp) <- str_sub(as.character(rownames(decomp)), start = 1, end = 15)
+
+decomp$ENSEMBL <- rownames(decomp)
+top.hvgs <- order(decomp$bio, decreasing=TRUE)
+head(decomp[top.hvgs,], 10)
+
+
+# we see the variance of ERCC spike-ins are much smaller than the var of endog genes
+# this reflects the heterogeneity in gene expression across cells of different types.
+# Also means we cannot fit a trend to the endog var only (i.e. cannot use.spikes=FALSE) in trendVar)
+pdf(file.path(baseDir, "figs/MeanVar_relationship_Marinov.pdf"), width = 6, height = 6)
+par(mfrow=c(1,1))
+plot(decomp$mean, decomp$total, xlab="Mean log-expression", ylab="Variance")
+points(decomp[top.hvgs[1:1000],]$mean, decomp[top.hvgs[1:1000],]$total, col = "green")
+dev.off()
+```
+
+
+Calculate gc content for every gene in mouse genome 
+```{r}
+library(BSgenome.Hsapiens.UCSC.hg19) # load BSgenome package for human (hg19) 
+genome <- BSgenome.Hsapiens.UCSC.hg19
+
+library("GenomicFeatures")
+txdb <- makeTxDbFromUCSC("hg19", "ensGene")
+exonsByGene <- exonsBy(txdb, by="gene")
+
+# extract DNA string for only exons in each human gene
+gene_seqs1 <- extractTranscriptSeqs(genome, exonsByGene)
+
+# function to calculate gc content 
+gcContent <- function(x){
+  alf <- alphabetFrequency(x, as.prob=TRUE)
+  sum(alf[c("G", "C")]) 
+}
+
+# calculate gc content for every transcript in mouse genome
+genedbNames <- names(gene_seqs1)
+gcVals <- numeric(length(genedbNames))             # pre-allocate...
+# minLen <- pmin(width(gene_seqs1), 300)
+Sys.time()
+for (ind in seq_along(genedbNames)) { 
+  gcVals[ind] <- gcContent(subseq(gene_seqs1[[ind]]))
+}
+Sys.time()
+
+dat <- data.frame(ENSEMBL = genedbNames, "gc" = gcVals)
+head(dat)
+```
+
+Convert from gene symbol to ENSEMBL name
+
+```{r}
+
+dat.joined <- left_join(decomp, dat, by = "ENSEMBL")
+x <- dat.joined[,c(1:4,7:8)]
+x <- na.omit(x)
+
+
+jpeg(file.path(baseDir, "figs/VarandGCcontent_relationship_Marionv_SplitPool_A.jpeg"), width = 1000, height = 1000)
+# jpeg(file.path(baseDir, "figs/VarandGCcontent_relationship_Marionv_SplitPool_B.jpeg"), width = 1000, height = 1000)
+# jpeg(file.path(baseDir, "figs/VarandGCcontent_relationship_Marionv_SplitPool_AandB.jpeg"), width = 1000, height = 1000)
+# jpeg(file.path(baseDir, "figs/VarandGCcontent_relationship_Marionv_singlecells.jpeg"), width = 1000, height = 1000)
+par(mfrow=c(2,2))
+plot(decomp$mean, decomp$total, xlab="Mean log-expression", ylab="Variance")
+points(decomp[top.hvgs[1:1000],]$mean, decomp[top.hvgs[1:1000],]$total, col = "green")
+
+keep <- sample(nrow(x), 5000)
+
+plot(x$gc,x$total, xlab = "GC content", ylab = "total variance")#, ylim = c(0, 0.4))
+fit.lo <- loess(x$total[keep] ~ x$gc[keep])
+points(x$gc[keep], predict(fit.lo), col = 2) 
+
+plot(x$gc, x$tech, xlab = "GC content", ylab = "technical variance")#, ylim = c(0, 0.4))
+fit.lo <- loess(x$tech[keep] ~ x$gc[keep])
+points(x$gc[keep], predict(fit.lo), col = 2)
+
+plot(x$gc, x$bio, xlab = "GC content", ylab = "biologial variance")#, ylim = c(-.02, 0.4))
+fit.lo <- loess(x$bio[keep] ~ x$gc[keep])
+points(x$gc[keep], predict(fit.lo), col = 2)
+
+dev.off()
+```
+
+
